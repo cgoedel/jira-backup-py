@@ -1,4 +1,5 @@
 import json
+import sys
 import yaml
 import time
 import os
@@ -8,6 +9,11 @@ import boto
 from boto.s3.key import Key
 import wizard
 
+class AuthException(Exception):
+    pass
+
+class RateLimitException(Exception):
+    pass
 
 def read_config():
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
@@ -29,40 +35,48 @@ class Atlassian:
 
     def create_confluence_backup(self):
         backup = self.session.post(self.start_confluence_backup, data=json.dumps(self.payload))
+        if backup.status_code == 401:
+            raise AuthException(backup, backup.text)
+        if backup.status_code == 412:
+            raise RateLimitException(backup, backup.text)
         if backup.status_code != 200:
             raise Exception(backup, backup.text)
-        else:
-            print('-> Backup process successfully started')
-            confluence_backup_status = 'https://{}/wiki/rest/obm/1.0/getprogress'.format(self.config['HOST_URL'])
+        
+        print('-> Backup process successfully started')
+        confluence_backup_status = 'https://{}/wiki/rest/obm/1.0/getprogress'.format(self.config['HOST_URL'])
+        time.sleep(self.wait)
+        while 'fileName' not in self.backup_status.keys():
+            self.backup_status = json.loads(self.session.get(confluence_backup_status).text)
+            print('Current status: {progress}; {description}'.format(
+                progress=self.backup_status['alternativePercentage'],
+                description=self.backup_status['currentStatus']))
             time.sleep(self.wait)
-            while 'fileName' not in self.backup_status.keys():
-                self.backup_status = json.loads(self.session.get(confluence_backup_status).text)
-                print('Current status: {progress}; {description}'.format(
-                    progress=self.backup_status['alternativePercentage'],
-                    description=self.backup_status['currentStatus']))
-                time.sleep(self.wait)
-            return 'https://{url}/wiki/download/{file_name}'.format(
-                url=self.config['HOST_URL'], file_name=self.backup_status['fileName'])
+        return 'https://{url}/wiki/download/{file_name}'.format(
+            url=self.config['HOST_URL'], file_name=self.backup_status['fileName'])
 
     def create_jira_backup(self):
         backup = self.session.post(self.start_jira_backup, data=json.dumps(self.payload))
+        if backup.status_code == 401:
+            raise AuthException(backup, backup.text)
+        if backup.status_code == 412:
+            raise RateLimitException(backup, backup.text)
         if backup.status_code != 200:
             raise Exception(backup, backup.text)
-        else:
-            task_id = json.loads(backup.text)['taskId']
-            print('-> Backup process successfully started: taskId={}'.format(task_id))
-            jira_backup_status = 'https://{jira_host}/rest/backup/1/export/getProgress?taskId={task_id}'.format(
-                jira_host=self.config['HOST_URL'], task_id=task_id)
+
+        task_id = json.loads(backup.text)['taskId']
+        print('-> Backup process successfully started: taskId={}'.format(task_id))
+        jira_backup_status = 'https://{jira_host}/rest/backup/1/export/getProgress?taskId={task_id}'.format(
+            jira_host=self.config['HOST_URL'], task_id=task_id)
+        time.sleep(self.wait)
+        while 'result' not in self.backup_status.keys():
+            self.backup_status = json.loads(self.session.get(jira_backup_status).text)
+            print('Current status: {status} {progress}; {description}'.format(
+                status=self.backup_status['status'],
+                progress=self.backup_status['progress'],
+                description=self.backup_status['description']))
             time.sleep(self.wait)
-            while 'result' not in self.backup_status.keys():
-                self.backup_status = json.loads(self.session.get(jira_backup_status).text)
-                print('Current status: {status} {progress}; {description}'.format(
-                    status=self.backup_status['status'],
-                    progress=self.backup_status['progress'],
-                    description=self.backup_status['description']))
-                time.sleep(self.wait)
-            return '{prefix}/{result_id}'.format(
-                prefix='https://' + self.config['HOST_URL'] + '/plugins/servlet', result_id=self.backup_status['result'])
+        return '{prefix}/{result_id}'.format(
+            prefix='https://' + self.config['HOST_URL'] + '/plugins/servlet', result_id=self.backup_status['result'])
 
     def download_file(self, url, local_filename):
         print('-> Downloading file from URL: {}'.format(url))
@@ -113,15 +127,30 @@ if __name__ == '__main__':
 
     print('-> Starting backup; include attachments: {}'.format(config['INCLUDE_ATTACHMENTS']))
     atlass = Atlassian(config)
-    if parser.parse_args().confluence: backup_url = atlass.create_confluence_backup()
-    else: backup_url = atlass.create_jira_backup()
+    try:
+        if parser.parse_args().confluence:
+            backup_file_prefix = 'confluence'
+            backup_url = atlass.create_confluence_backup()
+        else:
+            backup_file_prefix = 'jira'
+            backup_url = atlass.create_jira_backup()
 
-    print('-> Backup URL: {}'.format(backup_url))
-    file_name = '{timestemp}_{uuid}.zip'.format(
-        timestemp=time.strftime('%d%m%Y_%H%M'), uuid=backup_url.split('/')[-1].replace('?fileId=', ''))
+        print('-> Backup URL: {}'.format(backup_url))
+        file_name = '{backup_file_prefix}_{timestamp}_{uuid}.zip'.format(
+            timestamp=time.strftime('%d%m%Y_%H%M'),
+            uuid=backup_url.split('/')[-1].replace('?fileId=', ''),
+            backup_file_prefix=backup_file_prefix
+        )
 
-    if config['DOWNLOAD_LOCALLY'] == 'true':
-        atlass.download_file(backup_url, file_name)
+        if config['DOWNLOAD_LOCALLY'] == 'true':
+            atlass.download_file(backup_url, file_name)
 
-    if config['UPLOAD_TO_S3']['S3_BUCKET'] != '':
-        atlass.stream_to_s3(backup_url, file_name)
+        if config['UPLOAD_TO_S3']['S3_BUCKET'] != '':
+            atlass.stream_to_s3(backup_url, file_name)
+    except AuthException as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+    except RateLimitException as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(3)
+        
