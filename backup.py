@@ -137,7 +137,7 @@ if __name__ == '__main__':
 
         print('-> Backup URL: {}'.format(backup_url))
         file_name = '{backup_file_prefix}_{timestamp}_{uuid}.zip'.format(
-            timestamp=time.strftime('%d%m%Y_%H%M'),
+            timestamp=time.strftime('%Y%m%d_%H%M'),
             uuid=backup_url.split('/')[-1].replace('?fileId=', ''),
             backup_file_prefix=backup_file_prefix
         )
